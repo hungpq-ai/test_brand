@@ -1,0 +1,27 @@
+brands:
+  - "Mondelez"
+
+engines:
+  chatgpt:
+    enabled: true
+    model: "gpt-5.1"
+    rpm: 60
+  gemini:
+    enabled: true
+    model: "gemini-3-flash-preview"
+    rpm: 15
+  claude:
+    enabled: true
+    model: "claude-sonnet-4.5"
+    rpm: 50
+  perplexity:
+    enabled: true
+    model: "sonar-pro"
+    rpm: 50
+
+extraction:
+  method: "regex"
+
+output:
+  dir: "output"
+  save_raw_responses: true
