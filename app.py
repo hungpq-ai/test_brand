@@ -1379,10 +1379,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                     <h1 class="section-title">Test Prompts</h1>
                     <p class="section-subtitle">Test single prompts or upload batch CSV files</p>
                 </div>
-                <div style="max-width: 800px;">
-                    <!-- Quick Test: Single Prompt -->
-                    <div style="background: var(--color-surface); border: 1px solid var(--color-border); border-radius: 12px; padding: 32px; margin-bottom: 24px;">
-                        <h3 style="font-size: 16px; font-weight: 700; margin-bottom: 12px;">⚡ Quick Test - Single Prompt</h3>
+
+                <!-- Quick Test Form - Full Width -->
+                <div style="background: var(--color-surface); border: 1px solid var(--color-border); border-radius: 12px; padding: 32px; margin-bottom: 24px;">
+                    <h3 style="font-size: 16px; font-weight: 700; margin-bottom: 12px;">⚡ Quick Test - Single Prompt</h3>
                         <p style="color: var(--color-text-light); margin-bottom: 24px;">
                             Test a single prompt across selected AI engines instantly
                         </p>
@@ -1439,17 +1439,17 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                             </div>
                             <p id="quick-progress-text" style="font-size: 13px; color: var(--color-text-light); text-align: center;"></p>
                         </div>
+                </div>
 
-                        <!-- Quick Test Results -->
-                        <div id="quick-results" style="display: none; margin-top: 24px; padding-top: 24px; border-top: 1px solid var(--color-border);">
-                            <h4 style="font-size: 14px; font-weight: 700; margin-bottom: 16px;">🎯 Results</h4>
-                            <div id="quick-results-content"></div>
-                        </div>
-                    </div>
+                <!-- Quick Test Results - Full Width -->
+                <div id="quick-results" style="display: none; margin-top: 24px;">
+                    <h4 style="font-size: 14px; font-weight: 700; margin-bottom: 16px;">🎯 Results</h4>
+                    <div id="quick-results-content"></div>
+                </div>
 
-                    <!-- Batch Upload: CSV -->
-                    <div style="background: var(--color-surface); border: 1px solid var(--color-border); border-radius: 12px; padding: 32px;">
-                        <h3 style="font-size: 16px; font-weight: 700; margin-bottom: 12px;">📤 Batch Upload - CSV File</h3>
+                <!-- Batch Upload Form - Full Width -->
+                <div style="background: var(--color-surface); border: 1px solid var(--color-border); border-radius: 12px; padding: 32px;">
+                    <h3 style="font-size: 16px; font-weight: 700; margin-bottom: 12px;">📤 Batch Upload - CSV File</h3>
                         <p style="color: var(--color-text-light); margin-bottom: 24px;">
                             Upload a CSV file to test multiple prompts at once. File must have a <code style="background:#f3f4f6;padding:2px 6px;border-radius:4px;">prompt</code> column.
                         </p>
@@ -1827,20 +1827,24 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 </div>
             `;
 
-            results.forEach(result => {
+            // Group engines in 2x2 grid for easy comparison
+            html += `<div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 16px; margin-bottom: 24px;">`;
+
+            results.forEach((result, idx) => {
                 const engine = result.engine || 'Unknown';
                 const brands = result.brands || [];
                 const response = result.response || '';
                 const error = result.error;
+                const engineId = `engine-${idx}`;
 
                 if (error) {
                     html += `
-                        <div style="background: var(--color-surface); border: 1px solid var(--color-error); border-radius: 8px; padding: 20px; margin-bottom: 16px;">
+                        <div style="background: var(--color-surface); border: 1px solid var(--color-error); border-radius: 8px; padding: 16px;">
                             <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
-                                <h4 style="font-size: 16px; font-weight: 700;">${engine.toUpperCase()}</h4>
-                                <span style="color: var(--color-error); font-weight: 600;">Error</span>
+                                <h4 style="font-size: 14px; font-weight: 700;">${engine.toUpperCase()}</h4>
+                                <span style="color: var(--color-error); font-weight: 600; font-size: 12px;">Error</span>
                             </div>
-                            <div style="padding: 12px; background: #fee2e2; border-radius: 6px; color: #991b1b;">
+                            <div style="padding: 12px; background: #fee2e2; border-radius: 6px; color: #991b1b; font-size: 12px;">
                                 ${error}
                             </div>
                         </div>
@@ -1851,54 +1855,86 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 const mentioned = brands.filter(b => b.mentioned);
                 const brandList = mentioned.map(b => {
                     const rankStr = b.rank ? `#${b.rank}` : '—';
-                    return `<div style="display: flex; justify-content: space-between; padding: 8px 12px; background: #d1fae5; border-radius: 6px; margin-bottom: 6px;">
+                    return `<div style="display: flex; justify-content: space-between; padding: 6px 10px; background: #d1fae5; border-radius: 6px; margin-bottom: 4px; font-size: 12px;">
                         <span style="font-weight: 600; color: #065f46;">${b.brand}</span>
-                        <span style="color: #065f46;">Rank: ${rankStr}</span>
+                        <span style="color: #065f46;">${rankStr}</span>
                     </div>`;
                 }).join('');
 
+                const isExpanded = false;
+                const previewLength = 400;
+                const needsExpansion = response.length > previewLength;
+
                 html += `
-                    <div style="background: var(--color-surface); border: 1px solid var(--color-border); border-radius: 8px; padding: 20px; margin-bottom: 16px;">
-                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
-                            <h4 style="font-size: 16px; font-weight: 700;">${engine.toUpperCase()}</h4>
-                            <div style="font-size: 24px; font-weight: 700; color: ${mentioned.length > 0 ? 'var(--color-success)' : 'var(--color-text-light)'};">
+                    <div style="background: var(--color-surface); border: 1px solid var(--color-border); border-radius: 8px; padding: 16px; display: flex; flex-direction: column;">
+                        <!-- Header -->
+                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; padding-bottom: 12px; border-bottom: 1px solid var(--color-border);">
+                            <h4 style="font-size: 14px; font-weight: 700;">${engine.toUpperCase()}</h4>
+                            <div style="font-size: 18px; font-weight: 700; color: ${mentioned.length > 0 ? 'var(--color-success)' : 'var(--color-text-light)'};">
                                 ${mentioned.length}/${brands.length}
                             </div>
                         </div>
 
-                        <div style="display: grid; grid-template-columns: 350px 1fr; gap: 20px;">
-                            <!-- Left: Brand mentions -->
-                            <div>
-                                ${mentioned.length > 0 ? `
-                                    <div style="font-size: 12px; font-weight: 700; color: var(--color-text-light); margin-bottom: 8px;">MENTIONED BRANDS</div>
-                                    ${brandList}
-                                ` : `
-                                    <div style="text-align: center; padding: 20px; background: var(--color-bg); border-radius: 6px;">
-                                        <p style="color: var(--color-text-light);">No tracked brands mentioned</p>
-                                    </div>
-                                `}
-                            </div>
+                        <!-- Brand mentions (compact) -->
+                        <div style="margin-bottom: 12px;">
+                            ${mentioned.length > 0 ? `
+                                <div style="font-size: 11px; font-weight: 700; color: var(--color-text-light); margin-bottom: 6px;">MENTIONED BRANDS</div>
+                                ${brandList}
+                            ` : `
+                                <div style="text-align: center; padding: 12px; background: var(--color-bg); border-radius: 6px;">
+                                    <p style="color: var(--color-text-light); font-size: 12px;">No brands mentioned</p>
+                                </div>
+                            `}
+                        </div>
 
-                            <!-- Right: Response preview -->
-                            <div>
-                                ${response ? `
-                                    <div style="font-size: 12px; font-weight: 700; color: var(--color-text-light); margin-bottom: 8px;">RESPONSE PREVIEW</div>
-                                    <div style="font-size: 13px; color: var(--color-text); line-height: 1.6; max-height: 300px; overflow-y: auto; white-space: pre-wrap; background: var(--color-bg); padding: 12px; border-radius: 6px;">
-                                        ${response.substring(0, 1000)}${response.length > 1000 ? '...' : ''}
-                                    </div>
-                                ` : `
-                                    <div style="padding: 20px; background: var(--color-bg); border-radius: 6px; text-align: center;">
-                                        <p style="color: var(--color-text-light);">No response available</p>
-                                    </div>
-                                `}
-                            </div>
+                        <!-- Response (full with expand/collapse) -->
+                        <div style="flex: 1;">
+                            ${response ? `
+                                <div style="font-size: 11px; font-weight: 700; color: var(--color-text-light); margin-bottom: 6px;">RESPONSE</div>
+                                <div id="${engineId}-response" style="font-size: 12px; color: var(--color-text); line-height: 1.5; white-space: pre-wrap; background: var(--color-bg); padding: 10px; border-radius: 6px; max-height: ${isExpanded ? 'none' : '200px'}; overflow-y: auto;">
+                                    <div id="${engineId}-preview">${response.substring(0, previewLength)}${needsExpansion && !isExpanded ? '...' : ''}</div>
+                                    <div id="${engineId}-full" style="display: none;">${response}</div>
+                                </div>
+                                ${needsExpansion ? `
+                                    <button onclick="toggleResponse('${engineId}')" id="${engineId}-btn" style="margin-top: 8px; padding: 6px 12px; background: var(--color-primary); color: white; border: none; border-radius: 6px; font-size: 11px; font-weight: 600; cursor: pointer;">
+                                        Show Full Response
+                                    </button>
+                                ` : ''}
+                            ` : `
+                                <div style="padding: 20px; background: var(--color-bg); border-radius: 6px; text-align: center;">
+                                    <p style="color: var(--color-text-light); font-size: 12px;">No response</p>
+                                </div>
+                            `}
                         </div>
                     </div>
                 `;
             });
 
+            html += `</div>`; // Close grid
+
             container.innerHTML = html;
             document.getElementById('quick-results').style.display = 'block';
+        }
+
+        function toggleResponse(engineId) {
+            const preview = document.getElementById(`${engineId}-preview`);
+            const full = document.getElementById(`${engineId}-full`);
+            const btn = document.getElementById(`${engineId}-btn`);
+            const container = document.getElementById(`${engineId}-response`);
+
+            if (full.style.display === 'none') {
+                // Show full
+                preview.style.display = 'none';
+                full.style.display = 'block';
+                btn.textContent = 'Show Less';
+                container.style.maxHeight = 'none';
+            } else {
+                // Show preview
+                preview.style.display = 'block';
+                full.style.display = 'none';
+                btn.textContent = 'Show Full Response';
+                container.style.maxHeight = '200px';
+            }
         }
 
         // Upload CSV handler
