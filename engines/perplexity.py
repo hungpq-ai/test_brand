@@ -9,8 +9,11 @@ class PerplexityEngine(BaseEngine):
 
     def __init__(self, model: str = "sonar-pro", rpm: int = 50):
         super().__init__(model, rpm)
+        api_key = os.getenv("PERPLEXITY_API_KEY")
+        if not api_key:
+            raise ValueError("PERPLEXITY_API_KEY environment variable is not set")
         self.client = AsyncOpenAI(
-            api_key=os.getenv("PERPLEXITY_API_KEY"),
+            api_key=api_key,
             base_url="https://api.perplexity.ai",
         )
 

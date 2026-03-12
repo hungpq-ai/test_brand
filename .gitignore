@@ -2,3 +2,31 @@
 output/
 __pycache__/
 *.pyc
+
+# Backups and temp files
+*.backup
+*_broken.py
+app.py.backup.*
+upload_feature_patch.js
+dashboard_modern.html
+
+# Test scripts
+check_models.py
+test_perplexity.py
+test_run.log
+list_models.py
+
+# Virtual environment
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# CSV data files
+*.csv
+prompts*.csv

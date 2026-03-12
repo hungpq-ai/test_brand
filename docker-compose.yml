@@ -1,0 +1,56 @@
+version: '3.8'
+
+services:
+  ai-brand-monitor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ai-brand-monitor
+    ports:
+      - "8501:8501"
+    volumes:
+      # Mount .env for API keys (read-only)
+      - ./.env:/app/.env:ro
+
+      # Mount output directory (read-write)
+      - ./output:/app/output
+
+      # Mount prompts (optional - can override)
+      - ./prompts.csv:/app/prompts.csv:ro
+
+      # Mount config (optional - can override)
+      - ./config.yaml:/app/config.yaml:ro
+
+    environment:
+      - PYTHONUNBUFFERED=1
+
+    restart: unless-stopped
+
+    # Run web dashboard by default
+    command: python app.py
+
+    # Health check
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8501/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # Alternative: CLI mode (commented out by default)
+  # ai-brand-monitor-cli:
+  #   build:
+  #     context: .
+  #     dockerfile: Dockerfile
+  #   container_name: ai-brand-monitor-cli
+  #   volumes:
+  #     - ./.env:/app/.env:ro
+  #     - ./output:/app/output
+  #     - ./prompts.csv:/app/prompts.csv:ro
+  #     - ./config.yaml:/app/config.yaml:ro
+  #   command: python main.py
+  #   restart: "no"
+
+networks:
+  default:
+    name: ai-brand-monitor-network

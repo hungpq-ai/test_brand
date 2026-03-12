@@ -6,3 +6,4 @@ pyyaml
 python-dotenv
 pandas
 tenacity
+python-multipart
