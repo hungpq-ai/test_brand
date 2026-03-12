@@ -16,6 +16,45 @@ class BrandMention:
     mentioned: bool
     rank: int | None  # 1-based position among tracked brands, None if not mentioned
     sources: list[str] = field(default_factory=list)
+    citation_type: str = "none"  # 'official', 'other', 'none'
+
+
+# Official domains for brands
+OFFICIAL_DOMAINS = {
+    "mondelez": ["mondelezinternational.com", "mondelez.com"],
+    "nestlé": ["nestle.com", "nestle.vn", "nestle.com.vn"],
+    "nestle": ["nestle.com", "nestle.vn", "nestle.com.vn"],
+    "mars": ["mars.com", "mars.com.vn", "marsinc.com"],
+    "pepsico": ["pepsico.com", "pepsico.com.vn"],
+    "orion": ["orionworld.com", "oriongroup.com.vn"],
+    "ferrero": ["ferrero.com"],
+}
+
+
+def get_citation_type(brand: str, sources: list[str]) -> str:
+    """
+    Determine citation type based on sources
+
+    Returns:
+        'official': Official brand website cited
+        'other': Other websites cited
+        'none': No citations
+    """
+    if not sources:
+        return "none"
+
+    brand_lower = brand.lower()
+    official_domains = OFFICIAL_DOMAINS.get(brand_lower, [])
+
+    # Check if any source is official
+    for source in sources:
+        source_lower = source.lower()
+        for official in official_domains:
+            if official in source_lower:
+                return "official"
+
+    # Has sources but not official
+    return "other"
 
 
 def extract_urls(text: str) -> list[str]:
@@ -147,11 +186,14 @@ def extract_brands(
             if extra_citations:
                 sources = list(set(sources) | set(extract_domains(extra_citations)))
 
+            citation_type = get_citation_type(brand, sources)
+
             results.append(BrandMention(
                 brand=brand,
                 mentioned=True,
                 rank=rank,
                 sources=sources,
+                citation_type=citation_type,
             ))
         else:
             results.append(BrandMention(

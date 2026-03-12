@@ -1,18 +1,22 @@
 brands:
   - "Mondelez"
+  - "Nestlé"
+  - "Mars"
+  - "PepsiCo"
+  - "Orion"
 
 engines:
   chatgpt:
-    enabled: true
-    model: "gpt-5.1"
+    enabled: true  # Auto-fallback: Yescale → DeepBricks
+    model: "gpt-5.1"  # GPT 5.1 (DeepBricks model name)
     rpm: 60
   gemini:
     enabled: true
-    model: "gemini-3-flash-preview"
+    model: "gemini-2.5-flash"  # Gemini 2.5 Flash ✅
     rpm: 15
   claude:
     enabled: true
-    model: "claude-sonnet-4.5"
+    model: "claude-3-5-sonnet-20241022"  # Claude 3.5 Sonnet (DeepBricks model name)
     rpm: 50
   perplexity:
     enabled: true
