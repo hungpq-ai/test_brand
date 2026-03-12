@@ -7,6 +7,7 @@ import pandas as pd
 
 from engines.base import BaseEngine, EngineResponse
 from extractor import extract_brands
+from scoring import BrandScore, calculate_ai_visibility_score, get_score_grade
 
 
 async def process_one(
@@ -41,15 +42,13 @@ async def process_one(
 
     rows = []
     for m in mentions:
-        rank_score = 0
-        if m.mentioned and m.rank is not None:
-            # Top 1 = 1.0, Top 2 = 0.8, Top 3 = 0.6, Top 4 = 0.4, Top 5 = 0.2, 6+ = 0.1
-            if m.rank <= 5:
-                rank_score = round(1 - (m.rank - 1) * 0.2, 2)
-            else:
-                rank_score = 0.1
-        elif m.mentioned and m.rank is None:
-            rank_score = 0.1  # Mentioned but not in a list
+        # Create BrandScore for new scoring system
+        brand_score = BrandScore(
+            brand=m.brand,
+            mentioned=m.mentioned,
+            rank=m.rank,
+            citation_type=m.citation_type,
+        )
 
         rows.append({
             "Query": prompt,
@@ -57,7 +56,9 @@ async def process_one(
             "Brand": m.brand,
             "Mention": "Yes" if m.mentioned else "No",
             "Rank": m.rank,
-            "Rank Score": rank_score,
+            "Ranking Score": brand_score.ranking_score,  # NEW: 100, 80, 60...
+            "Citation Type": m.citation_type,  # NEW: official/other/none
+            "Citation Score": brand_score.citation_score,  # NEW: 100/50/0
             "Source": "; ".join(m.sources) if m.sources else "",
             "Error": None,
         })
@@ -130,11 +131,44 @@ async def run_all(
 
     # Save combined results CSV
     df = pd.DataFrame(all_rows)
-    col_order = ["Query", "AI Engine", "Brand", "Mention", "Rank", "Rank Score", "Source", "Error"]
+    col_order = ["Query", "AI Engine", "Brand", "Mention", "Rank", "Ranking Score", "Citation Type", "Citation Score", "Source", "Error"]
     df = df[[c for c in col_order if c in df.columns]]
     csv_path = os.path.join(output_dir, f"results_{timestamp}.csv")
     df.to_csv(csv_path, index=False)
     print(f"\nResults saved to: {csv_path}")
+
+    # Calculate aggregate AI Visibility Scores for each brand
+    print(f"\nCalculating AI Visibility Scores...")
+    brand_scores_summary = []
+
+    for brand in brands:
+        brand_df = df[df["Brand"] == brand].copy()
+
+        # Create BrandScore objects for aggregate calculation
+        brand_score_objs = []
+        for _, row in brand_df.iterrows():
+            if pd.notna(row.get("Error")) and row["Error"]:
+                continue  # Skip error rows
+
+            brand_score_objs.append(BrandScore(
+                brand=brand,
+                mentioned=(row["Mention"] == "Yes"),
+                rank=int(row["Rank"]) if pd.notna(row["Rank"]) else None,
+                citation_type=row.get("Citation Type", "none"),
+            ))
+
+        if brand_score_objs:
+            scores = calculate_ai_visibility_score(brand_score_objs)
+            scores["brand"] = brand
+            scores["grade"] = get_score_grade(scores["ai_visibility_score"])
+            brand_scores_summary.append(scores)
+
+    # Save aggregate scores
+    if brand_scores_summary:
+        scores_df = pd.DataFrame(brand_scores_summary)
+        scores_csv = os.path.join(output_dir, f"ai_visibility_scores_{timestamp}.csv")
+        scores_df.to_csv(scores_csv, index=False)
+        print(f"AI Visibility Scores saved to: {scores_csv}")
 
     # Save per-brand CSVs: Query | AI Engine | {Brand} Mention | Rank | Rank Score | Source
     for brand in brands:

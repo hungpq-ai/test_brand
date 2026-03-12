@@ -162,8 +162,8 @@ def main():
             brand_mentions = mentioned[mentioned["Brand"] == brand]
             if not brand_mentions.empty:
                 avg_rank = brand_mentions["Rank"].mean()
-                avg_score = brand_mentions["Rank Score"].mean()
-                print(f"  {brand}: {len(brand_mentions)} mentions, avg rank: {avg_rank:.1f}, avg score: {avg_score:.2f}")
+                avg_ranking_score = brand_mentions["Ranking Score"].mean()
+                print(f"  {brand}: {len(brand_mentions)} mentions, avg rank: {avg_rank:.1f}, avg ranking score: {avg_ranking_score:.1f}")
             else:
                 print(f"  {brand}: 0 mentions")
 
