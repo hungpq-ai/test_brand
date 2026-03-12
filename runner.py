@@ -40,6 +40,9 @@ async def process_one(
         extra_citations=response.citations if response.citations else None,
     )
 
+    # Get list of mentioned competitors for each brand
+    mentioned_brands = [m for m in mentions if m.mentioned]
+
     rows = []
     for m in mentions:
         # Create BrandScore for new scoring system
@@ -50,6 +53,15 @@ async def process_one(
             citation_type=m.citation_type,
         )
 
+        # Build competitor presence list (other brands mentioned in same response)
+        competitors = []
+        for other in mentioned_brands:
+            if other.brand != m.brand:
+                rank_str = f"Rank {other.rank}" if other.rank else "mentioned"
+                competitors.append(f"{other.brand} ({rank_str})")
+
+        competitor_presence = "; ".join(competitors) if competitors else ""
+
         rows.append({
             "Query": prompt,
             "AI Engine": engine.name,
@@ -59,6 +71,7 @@ async def process_one(
             "Ranking Score": brand_score.ranking_score,  # NEW: 100, 80, 60...
             "Citation Type": m.citation_type,  # NEW: official/other/none
             "Citation Score": brand_score.citation_score,  # NEW: 100/50/0
+            "Competitors Mentioned": competitor_presence,  # NEW: Competitor presence
             "Source": "; ".join(m.sources) if m.sources else "",
             "Error": None,
         })
@@ -72,7 +85,7 @@ async def run_all(
     brands: list[str],
     output_dir: str = "output",
     save_raw: bool = True,
-) -> pd.DataFrame:
+) -> tuple[pd.DataFrame, dict]:
     """Run all prompts against all engines and collect results."""
     os.makedirs(output_dir, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -137,6 +150,30 @@ async def run_all(
     df.to_csv(csv_path, index=False)
     print(f"\nResults saved to: {csv_path}")
 
+    # Persist to SQLite database
+    try:
+        from db import insert_results
+        full_df = pd.DataFrame(all_rows)
+        db_rows = []
+        for _, row in full_df.iterrows():
+            db_rows.append({
+                "Query": row.get("Query", ""),
+                "AI Engine": row.get("AI Engine", ""),
+                "Brand": row.get("Brand", ""),
+                "Mention": row.get("Mention", "No"),
+                "Rank": row.get("Rank") if pd.notna(row.get("Rank")) else None,
+                "Ranking Score": row.get("Ranking Score", 0),
+                "Citation Type": row.get("Citation Type", "none"),
+                "Citation Score": row.get("Citation Score", 0),
+                "Source": row.get("Source", ""),
+                "Competitors Mentioned": row.get("Competitors Mentioned", ""),
+                "Error": row.get("Error") if pd.notna(row.get("Error")) else None,
+            })
+        insert_results(db_rows, timestamp, source="batch")
+        print(f"Results persisted to database ({len(db_rows)} rows)")
+    except Exception as e:
+        print(f"Warning: Failed to persist to database: {e}")
+
     # Calculate aggregate AI Visibility Scores for each brand
     print(f"\nCalculating AI Visibility Scores...")
     brand_scores_summary = []
@@ -163,12 +200,23 @@ async def run_all(
             scores["grade"] = get_score_grade(scores["ai_visibility_score"])
             brand_scores_summary.append(scores)
 
+    # Track all output files for download
+    output_files = {
+        "timestamp": timestamp,
+        "results_csv": csv_path,
+        "scores_csv": None,
+        "raw_csv": None,
+        "raw_json": None,
+        "brand_csvs": []
+    }
+
     # Save aggregate scores
     if brand_scores_summary:
         scores_df = pd.DataFrame(brand_scores_summary)
         scores_csv = os.path.join(output_dir, f"ai_visibility_scores_{timestamp}.csv")
         scores_df.to_csv(scores_csv, index=False)
         print(f"AI Visibility Scores saved to: {scores_csv}")
+        output_files["scores_csv"] = scores_csv
 
     # Save per-brand CSVs: Query | AI Engine | {Brand} Mention | Rank | Rank Score | Source
     for brand in brands:
@@ -178,6 +226,7 @@ async def run_all(
         brand_csv = os.path.join(output_dir, f"{brand}_{timestamp}.csv")
         brand_df.to_csv(brand_csv, index=False)
         print(f"  Brand CSV: {brand_csv}")
+        output_files["brand_csvs"].append({"brand": brand, "path": brand_csv})
 
     # Save raw AI responses as CSV (one row per prompt+engine with full response)
     if save_raw and raw_responses:
@@ -185,11 +234,13 @@ async def run_all(
         raw_csv_path = os.path.join(output_dir, f"raw_responses_{timestamp}.csv")
         raw_df.to_csv(raw_csv_path, index=False)
         print(f"Raw responses saved to: {raw_csv_path}")
+        output_files["raw_csv"] = raw_csv_path
 
         # Also save as JSON for structured access
         raw_json_path = os.path.join(output_dir, f"raw_responses_{timestamp}.json")
         with open(raw_json_path, "w", encoding="utf-8") as f:
             json.dump(raw_responses, f, ensure_ascii=False, indent=2)
         print(f"Raw responses (JSON) saved to: {raw_json_path}")
+        output_files["raw_json"] = raw_json_path
 
-    return df
+    return df, output_files

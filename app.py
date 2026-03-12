@@ -19,7 +19,10 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 os.chdir(BASE_DIR)
 load_dotenv()
 
+from db import init_db, insert_results, get_all_results, get_history
+
 app = FastAPI(title="AI Brand Monitor")
+init_db()
 
 CONFIG_PATH = os.path.join(BASE_DIR, "config.yaml")
 PROMPTS_PATH = os.path.join(BASE_DIR, "prompts.csv")
@@ -43,13 +46,21 @@ def load_prompts():
 
 
 def get_results():
-    """Load all result CSV files and return combined data."""
-    pattern = os.path.join(OUTPUT_DIR, "Mondelez_*.csv")
-    files = sorted(glob.glob(pattern), reverse=True)
-    if not files:
+    """Load all results from SQLite database, filtered to primary brand."""
+    rows = get_all_results()
+    if not rows:
         return None
-    # Use the latest file
-    df = pd.read_csv(files[0])
+    df = pd.DataFrame(rows)
+    # Filter to primary brand from config (first brand) for dashboard view
+    config = load_config()
+    primary_brand = config.get("brands", ["Mondelez"])[0]
+    if "Brand" in df.columns:
+        df = df[df["Brand"] == primary_brand]
+    # Rename Mention column to match legacy format expected by frontend
+    if "Mention" in df.columns:
+        df = df.rename(columns={"Mention": f"{primary_brand} Mention"})
+    # Drop internal columns not needed by frontend
+    df = df.drop(columns=["Brand", "run_id", "source", "created_at"], errors="ignore")
     return df
 
 
@@ -120,6 +131,12 @@ async def api_results():
     return {"data": records, "summary": summary}
 
 
+@app.get("/api/history")
+async def api_history():
+    """Get full history with all brands per query, grouped by run+query."""
+    return get_history()
+
+
 @app.get("/api/raw/{engine}/{index}")
 async def api_raw_response(engine: str, index: int):
     raw = get_raw_responses()
@@ -131,11 +148,13 @@ async def api_raw_response(engine: str, index: int):
 
 @app.post("/api/upload-csv")
 async def api_upload_csv(file: UploadFile = File(...)):
-    """Upload CSV file and validate format"""
+    """Upload CSV or XLSX file and validate format"""
     try:
+        import pandas as pd
+
         # Check file extension
-        if not file.filename.endswith('.csv'):
-            return JSONResponse({"error": "File must be .csv format"}, status_code=400)
+        if not (file.filename.endswith('.csv') or file.filename.endswith('.xlsx')):
+            return JSONResponse({"error": "File must be .csv or .xlsx format"}, status_code=400)
 
         # Save to temp file
         temp_dir = tempfile.gettempdir()
@@ -144,30 +163,81 @@ async def api_upload_csv(file: UploadFile = File(...)):
         with open(temp_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
 
-        # Validate CSV format (must have "prompt" column)
+        # Read file with pandas (supports both CSV and XLSX)
         prompts = []
-        with open(temp_path, "r", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            if "prompt" not in reader.fieldnames:
+        csv_format = "unknown"
+
+        try:
+            # Try reading as Mondelez format first (with 7 header rows)
+            if file.filename.endswith('.xlsx'):
+                df = pd.read_excel(temp_path, skiprows=7)
+            else:
+                df = pd.read_csv(temp_path, skiprows=7, encoding='utf-8')
+
+            columns = df.columns.tolist()
+
+            # Format 1: Mondelez format with AI Query columns
+            if any(col in columns for col in ["AI Query Style", "AI Query Style tiếng Việt", "Natural VN query"]):
+                csv_format = "mondelez"
+                # Extract ALL available prompt columns (all 3 versions)
+                prompt_cols = ["AI Query Style", "AI Query Style tiếng Việt", "Natural VN query"]
+                available_cols = [col for col in prompt_cols if col in columns]
+
+                if available_cols:
+                    for idx, row in df.iterrows():
+                        # Extract prompts from ALL columns
+                        for col in available_cols:
+                            prompt = str(row[col]).strip() if pd.notna(row[col]) else ""
+                            # Skip category headers, empty rows, and duplicates
+                            if prompt and not prompt.startswith(("Commercial", "Comparison", "Brand", "Informational", "nan")) and prompt not in prompts:
+                                prompts.append(prompt)
+
+        except Exception:
+            pass  # Will try simple format below
+
+        # If Mondelez format didn't yield prompts, try reading from row 0 (simple format)
+        if not prompts:
+            try:
+                if file.filename.endswith('.xlsx'):
+                    df = pd.read_excel(temp_path)
+                else:
+                    df = pd.read_csv(temp_path, encoding='utf-8')
+
+                columns = df.columns.tolist()
+
+                # Format 2: Simple format with "prompt" column
+                if "prompt" in columns:
+                    csv_format = "simple"
+                    for idx, row in df.iterrows():
+                        prompt = str(row["prompt"]).strip() if pd.notna(row["prompt"]) else ""
+                        if prompt and prompt != "nan":
+                            prompts.append(prompt)
+
+                # Format 3: Use first column as prompts
+                elif len(columns) > 0:
+                    csv_format = "generic"
+                    first_col = columns[0]
+                    for idx, row in df.iterrows():
+                        prompt = str(row[first_col]).strip() if pd.notna(row[first_col]) else ""
+                        if prompt and prompt != "nan":
+                            prompts.append(prompt)
+
+            except Exception as e:
                 return JSONResponse(
-                    {"error": "CSV must have 'prompt' column"},
+                    {"error": f"Failed to read file: {str(e)}"},
                     status_code=400
                 )
 
-            for row in reader:
-                prompt = row.get("prompt", "").strip().strip('"')
-                if prompt:
-                    prompts.append(prompt)
-
         if not prompts:
-            return JSONResponse({"error": "No prompts found in CSV"}, status_code=400)
+            return JSONResponse({"error": "No valid prompts found in file"}, status_code=400)
 
         return {
             "success": True,
             "filename": file.filename,
             "temp_path": temp_path,
             "prompt_count": len(prompts),
-            "prompts_preview": prompts[:5]  # Show first 5
+            "prompts_preview": prompts[:5],  # Show first 5
+            "csv_format": csv_format  # simple, mondelez, or generic
         }
 
     except Exception as e:
@@ -180,6 +250,7 @@ async def api_run_uploaded(request: Request):
     body = await request.json()
     temp_path = body.get("temp_path")
     engines = body.get("engines", [])
+    brands_from_request = body.get("brands", [])
 
     if job_status["running"]:
         return JSONResponse({"error": "A job is already running"}, status_code=409)
@@ -200,16 +271,55 @@ async def api_run_uploaded(request: Request):
             if temp_path and os.path.exists(temp_path):
                 job_status["log"].append(f"Loading prompts from uploaded file: {temp_path}")
                 prompts = []
-                with open(temp_path, "r", encoding="utf-8") as f:
-                    reader = csv.DictReader(f)
-                    for row in reader:
-                        prompt = row.get("prompt", "").strip().strip('"')
-                        if prompt:
-                            prompts.append(prompt)
+
+                # Try Mondelez format first (skiprows=7)
+                try:
+                    df = pd.read_csv(temp_path, skiprows=7, encoding='utf-8')
+                    columns = df.columns.tolist()
+
+                    # Mondelez format with AI Query columns
+                    if any(col in columns for col in ["AI Query Style", "AI Query Style tiếng Việt", "Natural VN query"]):
+                        # Extract ALL available prompt columns (all 3 versions)
+                        prompt_cols = ["AI Query Style", "AI Query Style tiếng Việt", "Natural VN query"]
+                        available_cols = [col for col in prompt_cols if col in columns]
+
+                        if available_cols:
+                            for idx, row in df.iterrows():
+                                # Extract prompts from ALL columns
+                                for col in available_cols:
+                                    prompt = str(row[col]).strip() if pd.notna(row[col]) else ""
+                                    # Skip category headers, empty rows, and duplicates
+                                    if prompt and not prompt.startswith(("Commercial", "Comparison", "Brand", "Informational", "nan")) and prompt not in prompts:
+                                        prompts.append(prompt)
+                except Exception:
+                    pass  # Will try simple format below
+
+                # If Mondelez format didn't yield prompts, try simple format
+                if not prompts:
+                    try:
+                        df = pd.read_csv(temp_path, encoding='utf-8')
+                        columns = df.columns.tolist()
+
+                        # Simple format with "prompt" column
+                        if "prompt" in columns:
+                            for idx, row in df.iterrows():
+                                prompt = str(row["prompt"]).strip() if pd.notna(row["prompt"]) else ""
+                                if prompt and prompt != "nan":
+                                    prompts.append(prompt)
+                        # Use first column as prompts
+                        elif len(columns) > 0:
+                            first_col = columns[0]
+                            for idx, row in df.iterrows():
+                                prompt = str(row[first_col]).strip() if pd.notna(row[first_col]) else ""
+                                if prompt and prompt != "nan":
+                                    prompts.append(prompt)
+                    except Exception as e:
+                        job_status["log"].append(f"Failed to parse uploaded file: {e}")
             else:
                 prompts = load_prompts()
 
-            brands = config.get("brands", [])
+            # Use brands from request body if provided, otherwise fall back to config
+            brands = brands_from_request if brands_from_request else config.get("brands", [])
 
             ENGINE_CLASSES = {
                 "chatgpt": ChatGPTEngine,
@@ -244,11 +354,12 @@ async def api_run_uploaded(request: Request):
 
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
-            df = loop.run_until_complete(run_all(prompts, engine_objs, brands, output_dir, save_raw))
+            df, output_files = loop.run_until_complete(run_all(prompts, engine_objs, brands, output_dir, save_raw))
             loop.close()
 
             job_status["log"].append(f"Done! {len(df)} rows generated")
             job_status["progress"] = "Completed"
+            job_status["output_files"] = output_files  # Store file paths for download
         except Exception as e:
             job_status["log"].append(f"Error: {e}")
             job_status["progress"] = f"Error: {e}"
@@ -264,6 +375,27 @@ async def api_run_uploaded(request: Request):
 @app.get("/api/status")
 async def api_status():
     return job_status
+
+
+@app.get("/api/download/{filename}")
+async def api_download(filename: str):
+    """Download output file by filename"""
+    import os
+    from fastapi.responses import FileResponse
+
+    # Security: only allow files in output directory
+    output_dir = "output"
+    file_path = os.path.join(output_dir, filename)
+
+    # Check if file exists and is in output directory
+    if not os.path.exists(file_path) or not os.path.abspath(file_path).startswith(os.path.abspath(output_dir)):
+        return JSONResponse({"error": "File not found"}, status_code=404)
+
+    return FileResponse(
+        path=file_path,
+        filename=filename,
+        media_type="text/csv" if filename.endswith(".csv") else "application/json"
+    )
 
 
 @app.post("/api/query")
@@ -343,6 +475,45 @@ async def api_live_query(request: Request):
 
     tasks = [query_engine(name) for name in engine_names]
     results = await asyncio.gather(*tasks)
+
+    # Persist query results to database
+    try:
+        run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        db_rows = []
+        for r in results:
+            if isinstance(r, dict) and r.get("brands"):
+                for b in r["brands"]:
+                    db_rows.append({
+                        "Query": prompt,
+                        "AI Engine": r["engine"],
+                        "Brand": b["brand"],
+                        "Mention": "Yes" if b["mentioned"] else "No",
+                        "Rank": b.get("rank"),
+                        "Ranking Score": round(b.get("rank_score", 0) * 100),
+                        "Citation Type": "none",
+                        "Citation Score": 0,
+                        "Source": "; ".join(b.get("sources", [])),
+                        "Error": r.get("error"),
+                        "raw_response": r.get("response", ""),
+                    })
+            elif isinstance(r, dict) and r.get("error"):
+                for brand_name in brands:
+                    db_rows.append({
+                        "Query": prompt,
+                        "AI Engine": r.get("engine", "unknown"),
+                        "Brand": brand_name,
+                        "Mention": "No",
+                        "Rank": None,
+                        "Ranking Score": 0,
+                        "Citation Type": "none",
+                        "Citation Score": 0,
+                        "Source": "",
+                        "Error": r["error"],
+                    })
+        if db_rows:
+            insert_results(db_rows, run_id, source="query")
+    except Exception as e:
+        print(f"Warning: Failed to persist query results: {e}")
 
     return {"prompt": prompt, "brands": brands, "results": list(results)}
 
@@ -828,31 +999,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             color: var(--color-text);
         }
 
-        .header-right {
-            display: flex;
-            gap: 16px;
-            align-items: center;
-        }
-
-        .stat-pill {
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            padding: 6px 12px;
-            background: var(--color-bg);
-            border-radius: 8px;
-            font-size: 13px;
-            font-weight: 600;
-        }
-
-        .stat-pill .label {
-            color: var(--color-text-lighter);
-        }
-
-        .stat-pill .value {
-            color: var(--color-text);
-        }
-
         .content {
             padding: 32px;
             max-width: 1600px;
@@ -1262,16 +1408,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <div class="header-left">
                 <h2 id="page-title">Dashboard</h2>
             </div>
-            <div class="header-right">
-                <div class="stat-pill">
-                    <span class="label">Brand:</span>
-                    <span class="value" id="brand-name">Mondelez</span>
-                </div>
-                <div class="stat-pill">
-                    <span class="label">Prompts:</span>
-                    <span class="value" id="prompt-count">—</span>
-                </div>
-            </div>
         </div>
 
         <div class="content">
@@ -1342,9 +1478,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                     <div class="table-header">
                         <div class="table-title">Recent Queries</div>
                         <div class="filter-tabs">
-                            <button class="filter-tab active" onclick="filterTable('all', this)">All</button>
-                            <button class="filter-tab" onclick="filterTable('yes', this)">Mentioned</button>
-                            <button class="filter-tab" onclick="filterTable('no', this)">Not Mentioned</button>
                         </div>
                     </div>
                     <table>
@@ -1352,7 +1485,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                             <tr>
                                 <th>Query</th>
                                 <th>Engine</th>
-                                <th>Status</th>
                                 <th>Rank</th>
                                 <th>Score</th>
                             </tr>
@@ -1483,6 +1615,36 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                                 </div>
                             </div>
 
+                            <div style="margin-bottom: 24px;">
+                                <label style="display: block; font-weight: 600; margin-bottom: 8px; font-size: 14px;">Select Brands to Compare</label>
+                                <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px;">
+                                    <label style="display: flex; align-items: center; padding: 12px; background: var(--color-bg); border: 1px solid var(--color-border); border-radius: 8px; cursor: pointer;">
+                                        <input type="checkbox" name="brands" value="Mondelez" checked style="margin-right: 8px;">
+                                        <span style="font-weight: 600;">Mondelez</span>
+                                    </label>
+                                    <label style="display: flex; align-items: center; padding: 12px; background: var(--color-bg); border: 1px solid var(--color-border); border-radius: 8px; cursor: pointer;">
+                                        <input type="checkbox" name="brands" value="Nestlé" checked style="margin-right: 8px;">
+                                        <span style="font-weight: 600;">Nestlé</span>
+                                    </label>
+                                    <label style="display: flex; align-items: center; padding: 12px; background: var(--color-bg); border: 1px solid var(--color-border); border-radius: 8px; cursor: pointer;">
+                                        <input type="checkbox" name="brands" value="Mars" checked style="margin-right: 8px;">
+                                        <span style="font-weight: 600;">Mars</span>
+                                    </label>
+                                    <label style="display: flex; align-items: center; padding: 12px; background: var(--color-bg); border: 1px solid var(--color-border); border-radius: 8px; cursor: pointer;">
+                                        <input type="checkbox" name="brands" value="PepsiCo" checked style="margin-right: 8px;">
+                                        <span style="font-weight: 600;">PepsiCo</span>
+                                    </label>
+                                    <label style="display: flex; align-items: center; padding: 12px; background: var(--color-bg); border: 1px solid var(--color-border); border-radius: 8px; cursor: pointer;">
+                                        <input type="checkbox" name="brands" value="Orion" checked style="margin-right: 8px;">
+                                        <span style="font-weight: 600;">Orion</span>
+                                    </label>
+                                    <label style="display: flex; align-items: center; padding: 12px; background: var(--color-bg); border: 1px solid var(--color-border); border-radius: 8px; cursor: pointer;">
+                                        <input type="checkbox" name="brands" value="Ferrero" style="margin-right: 8px;">
+                                        <span style="font-weight: 600;">Ferrero</span>
+                                    </label>
+                                </div>
+                            </div>
+
                             <button type="submit" id="upload-btn"
                                 style="width: 100%; padding: 14px; background: var(--color-primary); color: white; border: none; border-radius: 8px; font-weight: 600; font-size: 14px; cursor: pointer; transition: all 0.2s;">
                                 📤 Upload and Start Test
@@ -1512,7 +1674,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
     <script>
         let allData = [];
-        let currentFilter = 'all';
 
         function switchSection(sectionName) {
             // Update nav
@@ -1550,9 +1711,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             const results = await resultsRes.json();
             const prompts = await promptsRes.json();
             const config = await configRes.json();
-
-            document.getElementById('brand-name').textContent = (config.brands || ['Mondelez'])[0];
-            document.getElementById('prompt-count').textContent = prompts.count;
 
             allData = results.data || [];
             const summary = results.summary || {};
@@ -1632,31 +1790,18 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
         function renderTable() {
             const tbody = document.getElementById('results-tbody');
-            const mentionCol = Object.keys(allData[0] || {}).find(k => k.includes('Mention')) || 'Mondelez Mention';
 
-            let filtered = allData;
-            if (currentFilter === 'yes') filtered = allData.filter(r => r[mentionCol] === 'Yes');
-            if (currentFilter === 'no') filtered = allData.filter(r => r[mentionCol] === 'No');
-
-            tbody.innerHTML = filtered.slice(0, 100).map((r, i) => {
-                const mentioned = r[mentionCol] === 'Yes';
+            tbody.innerHTML = allData.slice(0, 100).map((r, i) => {
                 const eng = r['AI Engine'] || '';
                 return `<tr>
                     <td style="max-width: 400px;">${(r.Query || '').substring(0, 100)}${(r.Query || '').length > 100 ? '...' : ''}</td>
                     <td><span class="badge badge-primary">${eng}</span></td>
-                    <td><span class="badge ${mentioned ? 'badge-success' : 'badge-error'}">${mentioned ? 'Mentioned' : 'Not Mentioned'}</span></td>
                     <td>${r.Rank != null && !isNaN(r.Rank) ? '#' + Math.round(r.Rank) : '—'}</td>
                     <td>${r['Ranking Score'] || 0}</td>
                 </tr>`;
             }).join('');
         }
 
-        function filterTable(filter, btn) {
-            currentFilter = filter;
-            document.querySelectorAll('.filter-tab').forEach(b => b.classList.remove('active'));
-            btn.classList.add('active');
-            renderTable();
-        }
 
         // Quick Test handler
         document.getElementById('quick-test-form').addEventListener('submit', async (e) => {
@@ -1944,6 +2089,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             const fileInput = document.getElementById('csv-file');
             const file = fileInput.files[0];
             const checkedEngines = Array.from(document.querySelectorAll('input[name="engines"]:checked')).map(e => e.value);
+            const checkedBrands = Array.from(document.querySelectorAll('input[name="brands"]:checked')).map(b => b.value);
 
             if (!file) {
                 showUploadStatus('Please select a file', 'error');
@@ -1952,6 +2098,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
             if (checkedEngines.length === 0) {
                 showUploadStatus('Please select at least one AI engine', 'error');
+                return;
+            }
+
+            if (checkedBrands.length === 0) {
+                showUploadStatus('Please select at least one brand', 'error');
                 return;
             }
 
@@ -1975,28 +2126,47 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 }
 
                 const uploadData = await uploadRes.json();
-                updateProgress(30, `Uploaded ${uploadData.count} prompts`);
+                updateProgress(30, `Uploaded ${uploadData.prompt_count} prompts`);
 
                 // Start test run
-                const testRes = await fetch('/api/run-test', {
+                const testRes = await fetch('/api/run-uploaded', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({engines: checkedEngines})
+                    body: JSON.stringify({
+                        temp_path: uploadData.temp_path,
+                        engines: checkedEngines,
+                        brands: checkedBrands
+                    })
                 });
 
                 if (!testRes.ok) throw new Error('Test run failed');
 
-                updateProgress(100, 'Test completed successfully!');
-                showUploadStatus(`✅ Success! Processed ${uploadData.count} prompts across ${checkedEngines.length} engines`, 'success');
+                // Poll status until job completes
+                updateProgress(40, 'Processing queries...');
+                const pollInterval = setInterval(async () => {
+                    try {
+                        const statusRes = await fetch('/api/status');
+                        const status = await statusRes.json();
 
-                // Reload data and switch to overview
-                setTimeout(() => {
-                    loadData();
-                    switchSection('overview');
-                    document.getElementById('upload-form').reset();
-                    document.getElementById('upload-progress').style.display = 'none';
-                    document.getElementById('upload-btn').disabled = false;
-                }, 2000);
+                        if (status.progress === 'Completed' && status.output_files) {
+                            clearInterval(pollInterval);
+                            updateProgress(100, 'Test completed successfully!');
+
+                            // Show download buttons
+                            showDownloadButtons(status.output_files, uploadData.prompt_count, checkedEngines.length, checkedBrands.length);
+                        } else if (status.progress && status.progress.startsWith('Error:')) {
+                            clearInterval(pollInterval);
+                            throw new Error(status.progress);
+                        } else {
+                            // Update progress
+                            const progressPercent = 40 + (Math.random() * 40); // 40-80%
+                            updateProgress(progressPercent, status.progress || 'Processing...');
+                        }
+                    } catch (err) {
+                        clearInterval(pollInterval);
+                        throw err;
+                    }
+                }, 2000); // Poll every 2 seconds
 
             } catch (error) {
                 showUploadStatus(`❌ Error: ${error.message}`, 'error');
@@ -2018,86 +2188,331 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             document.getElementById('progress-text').textContent = text;
         }
 
-        // Load and render history
-        function loadHistory() {
-            const container = document.getElementById('history-container');
+        async function showDownloadButtons(outputFiles, promptCount, engineCount, brandCount) {
+            const statusDiv = document.getElementById('upload-status');
+            statusDiv.style.display = 'block';
+            statusDiv.style.background = '#d1fae5';
+            statusDiv.style.color = '#065f46';
+            statusDiv.style.padding = '20px';
+
+            let html = `
+                <div>
+                    <div style="text-align: center; margin-bottom: 32px;">
+                        <h3 style="margin: 0 0 16px 0; color: #065f46;">✅ Test Completed Successfully!</h3>
+                        <p style="margin: 0 0 24px 0; color: #047857;">
+                            Processed ${promptCount} prompts × ${engineCount} engines × ${brandCount} brands
+                        </p>
+
+                        <div style="display: flex; gap: 12px; max-width: 600px; margin: 0 auto; flex-wrap: wrap; justify-content: center;">
+            `;
+
+            // Main results CSV
+            if (outputFiles.results_csv) {
+                const filename = outputFiles.results_csv.split('/').pop();
+                html += `
+                    <a href="/api/download/${filename}" download
+                       style="padding: 10px 16px; background: #059669; color: white; text-decoration: none; border-radius: 6px; font-weight: 500; font-size: 13px;">
+                        📊 Results CSV
+                    </a>
+                `;
+            }
+
+            // AI Visibility Scores CSV
+            if (outputFiles.scores_csv) {
+                const filename = outputFiles.scores_csv.split('/').pop();
+                html += `
+                    <a href="/api/download/${filename}" download
+                       style="padding: 10px 16px; background: #0891b2; color: white; text-decoration: none; border-radius: 6px; font-weight: 500; font-size: 13px;">
+                        🎯 Scores CSV
+                    </a>
+                `;
+            }
+
+            // Raw responses
+            if (outputFiles.raw_csv) {
+                const filename = outputFiles.raw_csv.split('/').pop();
+                html += `
+                    <a href="/api/download/${filename}" download
+                       style="padding: 10px 16px; background: #6366f1; color: white; text-decoration: none; border-radius: 6px; font-weight: 500; font-size: 13px;">
+                        📝 Raw Responses
+                    </a>
+                `;
+            }
+
+            html += `
+                            <button onclick="switchSection('overview'); loadData();"
+                                    style="padding: 10px 16px; background: white; color: #059669; border: 2px solid #059669; border-radius: 6px; font-weight: 500; cursor: pointer; font-size: 13px;">
+                                📊 Dashboard
+                            </button>
+                            <button onclick="location.reload();"
+                                    style="padding: 10px 16px; background: white; color: #6b7280; border: 2px solid #d1d5db; border-radius: 6px; cursor: pointer; font-size: 13px;">
+                                🔄 New Test
+                            </button>
+                        </div>
+                    </div>
+
+                    <div id="upload-results-container" style="margin-top: 32px;">
+                        <div style="text-align: center; padding: 20px;">
+                            <p style="color: #6b7280;">Loading results...</p>
+                        </div>
+                    </div>
+                </div>
+            `;
+
+            statusDiv.innerHTML = html;
+
+            // Hide progress bar
+            document.getElementById('upload-progress').style.display = 'none';
+            document.getElementById('upload-btn').disabled = false;
+
+            // Load and display results
+            try {
+                await loadData(); // Refresh data
+                displayUploadResults();
+            } catch (error) {
+                document.getElementById('upload-results-container').innerHTML = `
+                    <div style="text-align: center; padding: 20px; color: #dc2626;">
+                        <p>Failed to load results: ${error.message}</p>
+                    </div>
+                `;
+            }
+        }
+
+        function displayUploadResults() {
+            const container = document.getElementById('upload-results-container');
 
             if (!allData || allData.length === 0) {
                 container.innerHTML = `
-                    <div style="text-align: center; padding: 64px 32px;">
-                        <div style="font-size: 48px; margin-bottom: 16px;">📊</div>
-                        <h3 style="font-size: 18px; font-weight: 700; margin-bottom: 8px; color: var(--color-text);">No test results yet</h3>
-                        <p style="color: var(--color-text-light);">Upload a CSV file and run a test to see results here</p>
+                    <div style="text-align: center; padding: 20px; color: #6b7280;">
+                        <p>No results data available</p>
                     </div>
                 `;
                 return;
             }
 
-            // Group by engine and show detailed results
-            const byEngine = {};
-            allData.forEach(row => {
-                const eng = row['AI Engine'] || 'Unknown';
-                if (!byEngine[eng]) byEngine[eng] = [];
-                byEngine[eng].push(row);
-            });
+            // Get unique prompts, engines, brands
+            const uniquePrompts = [...new Set(allData.map(d => d['Query']))];
+            const uniqueEngines = [...new Set(allData.map(d => d['AI Engine']))];
+            const uniqueBrands = [...new Set(allData.map(d => d['Brand']))];
 
-            let html = '';
-            Object.entries(byEngine).forEach(([engine, rows]) => {
-                const mentionCol = Object.keys(rows[0] || {}).find(k => k.includes('Mention'));
-                const mentioned = rows.filter(r => r[mentionCol] === 'Yes').length;
-                const total = rows.length;
-                const rate = ((mentioned / total) * 100).toFixed(1);
+            // Build results summary
+            let html = `
+                <div style="background: white; border-radius: 8px; padding: 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.1);">
+                    <h4 style="margin: 0 0 16px 0; color: #111827;">📊 Results Preview</h4>
+
+                    <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin-bottom: 24px;">
+                        <div style="padding: 12px; background: #f3f4f6; border-radius: 6px;">
+                            <div style="font-size: 11px; color: #6b7280; margin-bottom: 4px;">QUERIES</div>
+                            <div style="font-size: 20px; font-weight: 600; color: #111827;">${uniquePrompts.length}</div>
+                        </div>
+                        <div style="padding: 12px; background: #f3f4f6; border-radius: 6px;">
+                            <div style="font-size: 11px; color: #6b7280; margin-bottom: 4px;">ENGINES</div>
+                            <div style="font-size: 20px; font-weight: 600; color: #111827;">${uniqueEngines.length}</div>
+                        </div>
+                        <div style="padding: 12px; background: #f3f4f6; border-radius: 6px;">
+                            <div style="font-size: 11px; color: #6b7280; margin-bottom: 4px;">BRANDS</div>
+                            <div style="font-size: 20px; font-weight: 600; color: #111827;">${uniqueBrands.length}</div>
+                        </div>
+                    </div>
+
+                    <div style="margin-bottom: 16px;">
+                        <h5 style="margin: 0 0 12px 0; font-size: 14px; color: #111827;">🏆 Brand Performance Summary</h5>
+            `;
+
+            // Calculate brand summary
+            uniqueBrands.forEach(brand => {
+                const brandData = allData.filter(d => d['Brand'] === brand);
+                const mentionCount = brandData.filter(d => d['Mention'] === 'Yes').length;
+                const totalQueries = uniquePrompts.length * uniqueEngines.length;
+                const mentionRate = ((mentionCount / totalQueries) * 100).toFixed(1);
+
+                const rankedData = brandData.filter(d => d['Mention'] === 'Yes' && d['Rank']);
+                const avgRank = rankedData.length > 0
+                    ? (rankedData.reduce((sum, d) => sum + parseFloat(d['Rank']), 0) / rankedData.length).toFixed(1)
+                    : '-';
 
                 html += `
-                    <div style="background: var(--color-surface); border: 1px solid var(--color-border); border-radius: 12px; padding: 24px; margin-bottom: 20px;">
-                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
+                    <div style="display: flex; justify-content: space-between; align-items: center; padding: 12px; background: #f9fafb; border-radius: 6px; margin-bottom: 8px;">
+                        <div style="font-weight: 500; color: #111827;">${brand}</div>
+                        <div style="display: flex; gap: 16px; font-size: 13px;">
                             <div>
-                                <h3 style="font-size: 18px; font-weight: 700; margin-bottom: 4px;">${engine}</h3>
-                                <p style="font-size: 13px; color: var(--color-text-light);">${total} queries tested</p>
+                                <span style="color: #6b7280;">Mention Rate:</span>
+                                <span style="font-weight: 600; color: #059669;">${mentionRate}%</span>
                             </div>
-                            <div style="text-align: right;">
-                                <div style="font-size: 32px; font-weight: 700; color: var(--color-primary); line-height: 1;">${rate}%</div>
-                                <div style="font-size: 12px; color: var(--color-text-light); margin-top: 4px;">mention rate</div>
+                            <div>
+                                <span style="color: #6b7280;">Avg Rank:</span>
+                                <span style="font-weight: 600; color: #0891b2;">${avgRank}</span>
                             </div>
-                        </div>
-                        <div style="height: 8px; background: var(--color-bg); border-radius: 4px; overflow: hidden; margin-bottom: 20px;">
-                            <div style="height: 100%; background: var(--color-primary); width: ${rate}%;"></div>
-                        </div>
-
-                        <!-- Recent queries from this engine -->
-                        <div style="margin-top: 20px;">
-                            <h4 style="font-size: 14px; font-weight: 700; margin-bottom: 12px; color: var(--color-text-light);">RECENT QUERIES</h4>
-                            ${rows.slice(0, 10).map(r => {
-                                const isMentioned = r[mentionCol] === 'Yes';
-                                const query = (r.Query || '').substring(0, 150);
-                                const rank = r.Rank != null && !isNaN(r.Rank) ? '#' + Math.round(r.Rank) : '—';
-
-                                return `
-                                    <div style="padding: 12px; background: var(--color-bg); border-radius: 8px; margin-bottom: 8px;">
-                                        <div style="display: flex; justify-content: space-between; align-items: start; gap: 16px;">
-                                            <div style="flex: 1;">
-                                                <div style="font-size: 14px; color: var(--color-text); margin-bottom: 6px;">${query}${query.length >= 150 ? '...' : ''}</div>
-                                                <div style="display: flex; gap: 8px; align-items: center;">
-                                                    <span style="display: inline-block; padding: 3px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; ${isMentioned ? 'background: #d1fae5; color: #065f46;' : 'background: #fee2e2; color: #991b1b;'}">
-                                                        ${isMentioned ? '✓ Mentioned' : '✗ Not Mentioned'}
-                                                    </span>
-                                                    ${isMentioned ? `<span style="font-size: 12px; color: var(--color-text-light);">Rank: ${rank}</span>` : ''}
-                                                </div>
-                                            </div>
-                                            <div style="font-size: 20px; font-weight: 700; color: var(--color-text-light); min-width: 40px; text-align: right;">
-                                                ${r['Ranking Score'] || 0}
-                                            </div>
-                                        </div>
-                                    </div>
-                                `;
-                            }).join('')}
-                            ${rows.length > 10 ? `<div style="text-align: center; margin-top: 12px; font-size: 13px; color: var(--color-text-light);">+ ${rows.length - 10} more queries</div>` : ''}
+                            <div>
+                                <span style="color: #6b7280;">Mentions:</span>
+                                <span style="font-weight: 600; color: #111827;">${mentionCount}/${totalQueries}</span>
+                            </div>
                         </div>
                     </div>
                 `;
             });
 
+            html += `
+                    </div>
+
+                    <div style="overflow-x: auto; max-height: 400px; overflow-y: auto; border: 1px solid #e5e7eb; border-radius: 6px;">
+                        <table style="width: 100%; border-collapse: collapse; font-size: 12px;">
+                            <thead style="background: #f9fafb; position: sticky; top: 0;">
+                                <tr>
+                                    <th style="padding: 10px; text-align: left; border-bottom: 1px solid #e5e7eb; font-weight: 600; color: #111827;">Query</th>
+                                    <th style="padding: 10px; text-align: left; border-bottom: 1px solid #e5e7eb; font-weight: 600; color: #111827;">Engine</th>
+                                    <th style="padding: 10px; text-align: left; border-bottom: 1px solid #e5e7eb; font-weight: 600; color: #111827;">Brand</th>
+                                    <th style="padding: 10px; text-align: center; border-bottom: 1px solid #e5e7eb; font-weight: 600; color: #111827;">Mention</th>
+                                    <th style="padding: 10px; text-align: center; border-bottom: 1px solid #e5e7eb; font-weight: 600; color: #111827;">Rank</th>
+                                    <th style="padding: 10px; text-align: left; border-bottom: 1px solid #e5e7eb; font-weight: 600; color: #111827;">Competitors</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+            `;
+
+            // Show first 100 rows
+            allData.slice(0, 100).forEach((row, idx) => {
+                const bgColor = idx % 2 === 0 ? '#ffffff' : '#f9fafb';
+                const mentionColor = row['Mention'] === 'Yes' ? '#059669' : '#6b7280';
+                const mentionIcon = row['Mention'] === 'Yes' ? '✅' : '❌';
+
+                html += `
+                    <tr style="background: ${bgColor};">
+                        <td style="padding: 10px; border-bottom: 1px solid #e5e7eb; max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" title="${row['Query']}">${row['Query']}</td>
+                        <td style="padding: 10px; border-bottom: 1px solid #e5e7eb;">${row['AI Engine']}</td>
+                        <td style="padding: 10px; border-bottom: 1px solid #e5e7eb; font-weight: 500;">${row['Brand']}</td>
+                        <td style="padding: 10px; border-bottom: 1px solid #e5e7eb; text-align: center; color: ${mentionColor};">${mentionIcon}</td>
+                        <td style="padding: 10px; border-bottom: 1px solid #e5e7eb; text-align: center; font-weight: 600;">${row['Rank'] || '-'}</td>
+                        <td style="padding: 10px; border-bottom: 1px solid #e5e7eb; font-size: 11px; color: #6b7280;">${row['Competitors Mentioned'] || '-'}</td>
+                    </tr>
+                `;
+            });
+
+            html += `
+                            </tbody>
+                        </table>
+                    </div>
+
+                    ${allData.length > 100 ? `
+                        <div style="margin-top: 12px; text-align: center; font-size: 13px; color: #6b7280;">
+                            Showing first 100 of ${allData.length} rows. Download CSV for full results.
+                        </div>
+                    ` : ''}
+                </div>
+            `;
+
             container.innerHTML = html;
+        }
+
+        // Load and render history
+        async function loadHistory() {
+            const container = document.getElementById('history-container');
+
+            try {
+                const res = await fetch('/api/history');
+                const historyData = await res.json();
+
+                if (!historyData || historyData.length === 0) {
+                    container.innerHTML = `
+                        <div style="text-align: center; padding: 64px 32px;">
+                            <div style="font-size: 48px; margin-bottom: 16px;">📊</div>
+                            <h3 style="font-size: 18px; font-weight: 700; margin-bottom: 8px;">No test results yet</h3>
+                            <p style="color: var(--color-text-light);">Upload a CSV or run a Quick Test to see results here</p>
+                        </div>
+                    `;
+                    return;
+                }
+
+                const engineLogos = {
+                    chatgpt: { icon: '🤖', color: '#059669' },
+                    gemini: { icon: '✨', color: '#2563eb' },
+                    claude: { icon: '🧠', color: '#d97706' },
+                    perplexity: { icon: '🔍', color: '#7c3aed' }
+                };
+
+                let html = '';
+                historyData.slice(0, 50).forEach((item, idx) => {
+                    const query = item.query || '';
+                    const engineNames = Object.keys(item.engines);
+                    const source = item.source === 'query' ? 'Quick Test' : 'Batch';
+                    const date = item.created_at ? new Date(item.created_at).toLocaleString() : '';
+
+                    // Engine badges
+                    const engineBadges = engineNames.map(e => {
+                        const logo = engineLogos[e] || { icon: '🤖', color: '#64748b' };
+                        return `<span style="display: inline-flex; align-items: center; gap: 3px; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; background: ${logo.color}15; color: ${logo.color};">${logo.icon} ${e}</span>`;
+                    }).join(' ');
+
+                    // Build detail panel (hidden by default)
+                    let detailHtml = '';
+                    engineNames.forEach(eng => {
+                        const logo = engineLogos[eng] || { icon: '🤖', color: '#64748b' };
+                        const brands = item.engines[eng] || [];
+                        detailHtml += `
+                            <div style="margin-bottom: 16px;">
+                                <div style="font-weight: 700; font-size: 13px; margin-bottom: 8px; color: ${logo.color};">${logo.icon} ${eng.charAt(0).toUpperCase() + eng.slice(1)}</div>
+                                <table style="width: 100%; font-size: 13px; border-collapse: collapse;">
+                                    <thead>
+                                        <tr style="border-bottom: 1px solid var(--color-border); text-align: left;">
+                                            <th style="padding: 6px 8px; font-weight: 600; color: var(--color-text-light);">Brand</th>
+                                            <th style="padding: 6px 8px; font-weight: 600; color: var(--color-text-light);">Status</th>
+                                            <th style="padding: 6px 8px; font-weight: 600; color: var(--color-text-light);">Rank</th>
+                                            <th style="padding: 6px 8px; font-weight: 600; color: var(--color-text-light);">Score</th>
+                                            <th style="padding: 6px 8px; font-weight: 600; color: var(--color-text-light);">Citation</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        ${brands.map(b => {
+                                            const mentioned = b.mention === 'Yes';
+                                            return `<tr style="border-bottom: 1px solid var(--color-border);">
+                                                <td style="padding: 6px 8px; font-weight: 500;">${b.brand}</td>
+                                                <td style="padding: 6px 8px;">
+                                                    <span style="padding: 2px 6px; border-radius: 3px; font-size: 11px; font-weight: 600; ${mentioned ? 'background: #d1fae5; color: #065f46;' : 'background: #fee2e2; color: #991b1b;'}">${mentioned ? 'Yes' : 'No'}</span>
+                                                </td>
+                                                <td style="padding: 6px 8px;">${b.rank != null ? '#' + Math.round(b.rank) : '—'}</td>
+                                                <td style="padding: 6px 8px; font-weight: 600;">${b.ranking_score || 0}</td>
+                                                <td style="padding: 6px 8px; font-size: 11px; color: var(--color-text-light);">${b.citation_type || 'none'}</td>
+                                            </tr>`;
+                                        }).join('')}
+                                    </tbody>
+                                </table>
+                            </div>
+                        `;
+                    });
+
+                    html += `
+                        <div style="background: var(--color-surface); border: 1px solid var(--color-border); border-radius: 10px; margin-bottom: 8px; overflow: hidden;">
+                            <div onclick="document.getElementById('detail-${idx}').style.display = document.getElementById('detail-${idx}').style.display === 'none' ? 'block' : 'none'; this.querySelector('.arrow').textContent = document.getElementById('detail-${idx}').style.display === 'none' ? '▶' : '▼';"
+                                 style="padding: 14px 18px; cursor: pointer; display: flex; justify-content: space-between; align-items: center; gap: 12px;">
+                                <div style="flex: 1; min-width: 0;">
+                                    <div style="font-size: 14px; color: var(--color-text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">${query}</div>
+                                    <div style="display: flex; gap: 6px; align-items: center; margin-top: 6px; flex-wrap: wrap;">
+                                        ${engineBadges}
+                                        <span style="font-size: 11px; color: var(--color-text-light); margin-left: 4px;">${source}</span>
+                                    </div>
+                                </div>
+                                <div style="display: flex; align-items: center; gap: 12px; flex-shrink: 0;">
+                                    <span style="font-size: 11px; color: var(--color-text-light);">${date}</span>
+                                    <span class="arrow" style="font-size: 10px; color: var(--color-text-light);">▶</span>
+                                </div>
+                            </div>
+                            <div id="detail-${idx}" style="display: none; padding: 0 18px 18px; border-top: 1px solid var(--color-border);">
+                                <div style="padding-top: 14px;">
+                                    ${detailHtml}
+                                </div>
+                            </div>
+                        </div>
+                    `;
+                });
+
+                if (historyData.length > 50) {
+                    html += `<div style="text-align: center; padding: 16px; color: var(--color-text-light); font-size: 13px;">Showing 50 of ${historyData.length} queries</div>`;
+                }
+
+                container.innerHTML = html;
+            } catch (err) {
+                container.innerHTML = `<div style="text-align: center; padding: 32px; color: #991b1b;">Failed to load history: ${err.message}</div>`;
+            }
         }
 
         loadData();

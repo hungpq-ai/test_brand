@@ -1,4 +1,5 @@
 import os
+import re
 from openai import AsyncOpenAI
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from .base import BaseEngine, EngineResponse, RateLimiter
@@ -14,27 +15,27 @@ class ChatGPTEngine(BaseEngine):
         self._providers = []
 
         # Model name mapping per provider
-        yescale_model = os.getenv("YESCALE_GPT_MODEL", "gpt-5.2")
+        yescale_model = os.getenv("YESCALE_GPT_MODEL", "gpt-5.1")
         deepbricks_model = os.getenv("DEEPBRICKS_GPT_MODEL", "gpt-5.1")
 
-        # Provider 1: Yescale (primary)
+        # Provider 1: Yescale (primary - working with gpt-5.1)
         yescale_key = os.getenv("YESCALE_API_KEY")
-        yescale_url = os.getenv("YESCALE_BASE_URL", "https://api.yescale.one/v1")
+        yescale_url = os.getenv("YESCALE_BASE_URL", "https://api.yescale.io/v1")
         if yescale_key:
             self._providers.append({
                 "name": "Yescale",
-                "client": AsyncOpenAI(api_key=yescale_key, base_url=yescale_url),
+                "client": AsyncOpenAI(api_key=yescale_key, base_url=yescale_url, timeout=90.0),
                 "model": yescale_model,
                 "active": True
             })
 
-        # Provider 2: DeepBricks (fallback)
+        # Provider 2: DeepBricks (fallback - intermittent 500 errors)
         deepbricks_key = os.getenv("DEEPBRICKS_API_KEY")
         deepbricks_url = os.getenv("DEEPBRICKS_BASE_URL", "https://api.deepbricks.ai/v1")
         if deepbricks_key:
             self._providers.append({
                 "name": "DeepBricks",
-                "client": AsyncOpenAI(api_key=deepbricks_key, base_url=deepbricks_url),
+                "client": AsyncOpenAI(api_key=deepbricks_key, base_url=deepbricks_url, timeout=90.0),
                 "model": deepbricks_model,
                 "active": True
             })
@@ -85,17 +86,43 @@ class ChatGPTEngine(BaseEngine):
             try:
                 # Use provider-specific model name
                 model_to_use = provider.get("model", self.model)
+
+                # Build messages with optional system prompt for source citation
+                messages = []
+                system_prompt = os.getenv("CHATGPT_SYSTEM_PROMPT", "")
+                if system_prompt:
+                    messages.append({"role": "system", "content": system_prompt})
+                messages.append({"role": "user", "content": prompt})
+
                 response = await provider["client"].chat.completions.create(
                     model=model_to_use,
-                    messages=[{"role": "user", "content": prompt}],
+                    messages=messages,
                     temperature=0.7,
-                    timeout=30.0,
+                    timeout=60.0,
                 )
                 text = response.choices[0].message.content or ""
+
+                # Extract URLs from response text
+                url_pattern = r'https?://[^\s\)\]\},<>"\']+'
+                citations = list(set(re.findall(url_pattern, text)))
+
+                # DEBUG: Log raw response structure
+                debug_mode = os.getenv("DEBUG_API_RESPONSES", "false").lower() == "true"
+                if debug_mode:
+                    print(f"\n{'='*80}")
+                    print(f"CHATGPT RAW RESPONSE DEBUG ({provider['name']})")
+                    print(f"{'='*80}")
+                    print(f"Model: {model_to_use}")
+                    print(f"Response type: {type(response)}")
+                    print(f"Response dict: {response.model_dump() if hasattr(response, 'model_dump') else response}")
+                    print(f"Extracted citations: {citations}")
+                    print(f"{'='*80}\n")
+
                 return EngineResponse(
                     engine=self.name,
                     prompt=prompt,
                     response_text=text,
+                    citations=citations,
                 )
 
             except Exception as e:
@@ -111,6 +138,16 @@ class ChatGPTEngine(BaseEngine):
                 # Check for rate limit errors
                 elif "429" in error_msg or "rate_limit" in error_msg.lower():
                     print(f"⏱️ {provider['name']} rate limited, trying fallback...")
+                    continue
+
+                # Check for 500 errors (temporary server issues)
+                elif "500" in error_msg or "502" in error_msg or "503" in error_msg:
+                    print(f"🔄 {provider['name']} server error (500), trying fallback...")
+                    continue
+
+                # Timeout errors
+                elif "timeout" in error_msg.lower() or "timed out" in error_msg.lower():
+                    print(f"⏱️ {provider['name']} timeout, trying fallback...")
                     continue
 
                 # Other errors - try next provider

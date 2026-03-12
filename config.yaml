@@ -9,22 +9,31 @@ engines:
   chatgpt:
     enabled: true  # Auto-fallback: Yescale → DeepBricks
     model: "gpt-5.1"  # GPT 5.1 (DeepBricks model name)
-    rpm: 60
+    rpm: 20  # Reduced from 30 to minimize errors
   gemini:
     enabled: true
-    model: "gemini-2.5-flash"  # Gemini 2.5 Flash ✅
-    rpm: 15
+    model: "gemini-3-flash-preview"  # Gemini 3 Flash (latest) ✅
+    rpm: 10  # Reduced from 15 to be safe
   claude:
     enabled: true
-    model: "claude-3-5-sonnet-20241022"  # Claude 3.5 Sonnet (DeepBricks model name)
-    rpm: 50
+    model: "claude-sonnet-4.5"  # Claude 4.5 Sonnet (DeepBricks) ✅
+    rpm: 20  # Reduced from 30 to minimize errors
   perplexity:
     enabled: true
-    model: "sonar-pro"
-    rpm: 50
+    model: "sonar"  # Cheaper than sonar-pro
+    rpm: 3  # Keep at 3 (already very low)
 
 extraction:
   method: "regex"
+
+# System prompt to encourage engines to cite sources
+# Used for ChatGPT/Claude (Gemini/Perplexity have native citations)
+system_prompt:
+  enable_source_request: true
+  prompt: |
+    IMPORTANT: When mentioning brands, products, or facts, please cite your sources by including URLs in your response.
+    Format: Include URLs directly in your text, for example: "According to https://example.com, Brand X is popular..."
+    This helps verify the accuracy of brand mentions and rankings.
 
 output:
   dir: "output"

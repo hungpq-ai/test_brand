@@ -35,6 +35,20 @@ class PerplexityEngine(BaseEngine):
         if hasattr(response, "citations"):
             citations = response.citations or []
 
+        # DEBUG: Log raw response structure
+        debug_mode = os.getenv("DEBUG_API_RESPONSES", "false").lower() == "true"
+        if debug_mode:
+            print(f"\n{'='*80}")
+            print(f"PERPLEXITY RAW RESPONSE DEBUG")
+            print(f"{'='*80}")
+            print(f"Model: {self.model}")
+            print(f"Response type: {type(response)}")
+            print(f"Has citations attr: {hasattr(response, 'citations')}")
+            print(f"Response dict: {response.model_dump() if hasattr(response, 'model_dump') else response}")
+            if hasattr(response, 'citations') and response.citations:
+                print(f"Citations found: {response.citations}")
+            print(f"{'='*80}\n")
+
         return EngineResponse(
             engine=self.name,
             prompt=prompt,
