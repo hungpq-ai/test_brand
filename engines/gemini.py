@@ -2,7 +2,7 @@ import os
 import re
 import asyncio
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-from .base import BaseEngine, EngineResponse, RateLimiter
+from .base import BaseEngine, EngineResponse, RateLimiter, KeyPool
 
 try:
     from google import genai
@@ -18,21 +18,17 @@ class GeminiEngine(BaseEngine):
         if genai is None:
             raise ImportError("google-genai package is required")
 
-        raw_keys = os.getenv("GOOGLE_API_KEY", "")
-        self._api_keys = [k.strip() for k in raw_keys.split(",") if k.strip()]
-        if not self._api_keys:
-            raise ValueError("GOOGLE_API_KEY is not set")
+        self._key_pool = KeyPool.from_env("GOOGLE_API_KEY")
+        self._clients = {
+            key: genai.Client(api_key=key)
+            for key in self._key_pool.keys
+        }
+        self.rate_limiter = RateLimiter(rpm, len(self._key_pool))
 
-        self._clients = [genai.Client(api_key=k) for k in self._api_keys]
-        self._key_index = 0
-        # Re-init rate limiter with num_keys for higher concurrency
-        self.rate_limiter = RateLimiter(rpm, len(self._api_keys))
-
-    def _next_client(self):
-        """Round-robin client selection across API keys."""
-        client = self._clients[self._key_index % len(self._clients)]
-        self._key_index += 1
-        return client
+    def _next_client(self) -> tuple[str, object]:
+        """Get next client via key rotation."""
+        key = self._key_pool.next_key()
+        return key, self._clients[key]
 
     @retry(
         stop=stop_after_attempt(3),
@@ -41,90 +37,97 @@ class GeminiEngine(BaseEngine):
         reraise=True,
     )
     async def query(self, prompt: str) -> EngineResponse:
-        client = self._next_client()
+        last_error = None
 
-        # Get system prompt if configured
-        system_prompt = os.getenv("GEMINI_SYSTEM_PROMPT", "")
+        for _ in range(len(self._key_pool)):
+            try:
+                key, client = self._next_client()
+            except ValueError:
+                break  # All keys exhausted
 
-        # Combine system prompt with user prompt if system prompt exists
-        full_prompt = prompt
-        if system_prompt:
-            full_prompt = f"{system_prompt}\n\nUser query: {prompt}"
+            try:
+                # Get system prompt if configured
+                system_prompt = os.getenv("GEMINI_SYSTEM_PROMPT", "")
+                full_prompt = prompt
+                if system_prompt:
+                    full_prompt = f"{system_prompt}\n\nUser query: {prompt}"
 
-        # Enable Google Search grounding if configured
-        enable_grounding = os.getenv("GEMINI_ENABLE_GROUNDING", "true").lower() == "true"
+                # Enable Google Search grounding if configured
+                enable_grounding = os.getenv("GEMINI_ENABLE_GROUNDING", "true").lower() == "true"
 
-        # Configure tools with google_search if grounding enabled
-        config = {}
-        if enable_grounding:
-            from google.genai import types
-            config = types.GenerateContentConfig(
-                tools=[types.Tool(google_search=types.GoogleSearch())],
-            )
+                config = {}
+                if enable_grounding:
+                    from google.genai import types
+                    config = types.GenerateContentConfig(
+                        tools=[types.Tool(google_search=types.GoogleSearch())],
+                    )
 
-        response = await asyncio.to_thread(
-            client.models.generate_content,
-            model=self.model,
-            contents=full_prompt,
-            config=config if enable_grounding else None,
-        )
-        text = response.text or ""
-        citations = []
+                response = await asyncio.to_thread(
+                    client.models.generate_content,
+                    model=self.model,
+                    contents=full_prompt,
+                    config=config if enable_grounding else None,
+                )
+                text = response.text or ""
+                citations = []
 
-        # PRIMARY: Extract from grounding_metadata (like Gemini Web UI)
-        if hasattr(response, 'candidates') and response.candidates:
-            candidate = response.candidates[0]
-            if hasattr(candidate, 'grounding_metadata') and candidate.grounding_metadata:
-                grounding = candidate.grounding_metadata
+                # PRIMARY: Extract from grounding_metadata
+                if hasattr(response, 'candidates') and response.candidates:
+                    candidate = response.candidates[0]
+                    if hasattr(candidate, 'grounding_metadata') and candidate.grounding_metadata:
+                        grounding = candidate.grounding_metadata
+                        if hasattr(grounding, 'grounding_chunks') and grounding.grounding_chunks:
+                            for chunk in grounding.grounding_chunks:
+                                if hasattr(chunk, 'web') and chunk.web:
+                                    title = getattr(chunk.web, 'title', None)
+                                    uri = getattr(chunk.web, 'uri', None)
+                                    if title and '.' in title and not title.startswith('http'):
+                                        full_url = f"https://{title}" if not title.startswith('http') else title
+                                        if full_url not in citations:
+                                            citations.append(full_url)
+                                    elif uri and uri not in citations:
+                                        citations.append(uri)
 
-                # Extract URLs from grounding_chunks (verified sources only)
-                if hasattr(grounding, 'grounding_chunks') and grounding.grounding_chunks:
-                    for chunk in grounding.grounding_chunks:
-                        # Check if chunk has web data
-                        if hasattr(chunk, 'web') and chunk.web:
-                            # The 'title' field contains the actual domain (e.g., 'hrc.com.vn')
-                            # The 'uri' field contains a redirect URL through vertexaisearch
-                            title = getattr(chunk.web, 'title', None)
-                            uri = getattr(chunk.web, 'uri', None)
+                # FALLBACK: Extract URLs from text
+                if not citations:
+                    url_pattern = r'https?://[^\s\)\]\},<>"\']+'
+                    citations = list(set(re.findall(url_pattern, text)))
 
-                            # If title looks like a domain, construct the URL
-                            if title and '.' in title and not title.startswith('http'):
-                                # Construct full URL from domain
-                                full_url = f"https://{title}" if not title.startswith('http') else title
-                                if full_url not in citations:
-                                    citations.append(full_url)
-                            elif uri and uri not in citations:
-                                # Fallback to redirect URI if title is not a domain
-                                citations.append(uri)
+                # DEBUG
+                debug_mode = os.getenv("DEBUG_API_RESPONSES", "false").lower() == "true"
+                if debug_mode:
+                    print(f"\n{'='*80}")
+                    print(f"GEMINI RAW RESPONSE DEBUG")
+                    print(f"{'='*80}")
+                    print(f"Model: {self.model}")
+                    print(f"Active keys: {self._key_pool.active_count()}/{len(self._key_pool)}")
+                    print(f"Grounding enabled: {enable_grounding}")
+                    print(f"Extracted citations: {citations}")
+                    print(f"{'='*80}\n")
 
-        # FALLBACK: If no grounding metadata, extract URLs from text (legacy behavior)
-        if not citations:
-            url_pattern = r'https?://[^\s\)\]\},<>"\']+'
-            citations = list(set(re.findall(url_pattern, text)))
+                return EngineResponse(
+                    engine=self.name,
+                    prompt=prompt,
+                    response_text=text,
+                    citations=citations,
+                )
 
-        # DEBUG: Log raw response structure
-        import json
-        debug_mode = os.getenv("DEBUG_API_RESPONSES", "false").lower() == "true"
-        if debug_mode:
-            print(f"\n{'='*80}")
-            print(f"GEMINI RAW RESPONSE DEBUG")
-            print(f"{'='*80}")
-            print(f"Model: {self.model}")
-            print(f"Grounding enabled: {enable_grounding}")
-            print(f"Response type: {type(response)}")
-            if hasattr(response, 'candidates') and response.candidates:
-                candidate = response.candidates[0]
-                if hasattr(candidate, 'grounding_metadata'):
-                    print(f"Has grounding_metadata: True")
-                    print(f"Grounding metadata: {candidate.grounding_metadata}")
-                else:
-                    print(f"Has grounding_metadata: False")
-            print(f"Extracted citations: {citations}")
-            print(f"{'='*80}\n")
+            except Exception as e:
+                error_msg = str(e)
+                last_error = e
 
-        return EngineResponse(
-            engine=self.name,
-            prompt=prompt,
-            response_text=text,
-            citations=citations,
-        )
+                # Quota/auth errors → mark key exhausted
+                if "401" in error_msg or "403" in error_msg or "quota" in error_msg.lower() or "exhausted" in error_msg.lower() or "RESOURCE_EXHAUSTED" in error_msg:
+                    print(f"🔄 Gemini key exhausted, rotating... ({self._key_pool.active_count()-1}/{len(self._key_pool)} remaining)")
+                    self._key_pool.mark_exhausted(key)
+                    continue
+
+                # Rate limit → try next key
+                if "429" in error_msg or "rate_limit" in error_msg.lower():
+                    print(f"⏱️ Gemini rate limited, rotating key...")
+                    continue
+
+                # Other errors → propagate for tenacity retry
+                raise
+
+        raise Exception(f"All Gemini API keys failed. Last error: {last_error}")
